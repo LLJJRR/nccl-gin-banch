@@ -15,6 +15,7 @@
 #include "compiler.h"
 
 NCCL_PARAM(GinProxyQueueSize, "GIN_PROXY_QUEUE_SIZE", -1);
+NCCL_PARAM(GinProxyPollBatch, "GIN_PROXY_POLL_BATCH", 1);
 extern int64_t ncclParamIbDataDirect();
 extern int64_t ncclParamDmaBufEnable();
 
@@ -587,24 +588,28 @@ static ncclResult_t ncclGinProxyDestroyContext(void *ginCtx) {
 
 static ncclResult_t ncclGinProxyProgress(void *ginCtx) {
   struct ginProxyCtx *ctx = (struct ginProxyCtx *)ginCtx;
+  int pollBatch = (int)ncclParamGinProxyPollBatch();
+  if (pollBatch < 1) pollBatch = 1;
+  if (pollBatch > 32) pollBatch = 32;
 
   for (int contextId = 0; contextId < ctx->nContexts; contextId++) {
     struct ginProxyHostGpuCtx *hostGpuCtx = ctx->hostGpuCtx + contextId;
     NCCLCHECK(proxyGinPollCompletions(ctx->collComm, ctx, hostGpuCtx));
     for (int targetRank = 0; targetRank < ctx->nRanks; targetRank++) {
-      // Poll on the GFD queue
-      ncclGinProxyGfd_t gfd;
-      struct ginProxyGfdState *state = NULL;
-      if (proxyGinPollGfd(ctx, hostGpuCtx, targetRank, &gfd, &state)) {
+      for (int p = 0; p < pollBatch; p++) {
+        ncclGinProxyGfd_t gfd;
+        struct ginProxyGfdState *state = NULL;
+        if (!proxyGinPollGfd(ctx, hostGpuCtx, targetRank, &gfd, &state)) break;
+
         ncclResult_t ret =
           proxyGinProcessGfd(ctx, hostGpuCtx, targetRank, &gfd, state);
         if (ret) ctx->hasError = ret;
         NCCLCHECK(ret);
       }
     }
-    if (ginBackend->ginProgress) ginBackend->ginProgress(ctx->ginCtx);
   }
 
+  if (ginBackend->ginProgress) ginBackend->ginProgress(ctx->ginCtx);
   return ncclSuccess;
 }
 

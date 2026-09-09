@@ -15,7 +15,7 @@
 #include "compiler.h"
 
 NCCL_PARAM(GinProxyQueueSize, "GIN_PROXY_QUEUE_SIZE", -1);
-NCCL_PARAM(GinProxyPollBatch, "GIN_PROXY_POLL_BATCH", 1);
+NCCL_PARAM(GinProxyPollBatch, "GIN_PROXY_POLL_BATCH", -1);
 extern int64_t ncclParamIbDataDirect();
 extern int64_t ncclParamDmaBufEnable();
 
@@ -589,7 +589,8 @@ static ncclResult_t ncclGinProxyDestroyContext(void *ginCtx) {
 static ncclResult_t ncclGinProxyProgress(void *ginCtx) {
   struct ginProxyCtx *ctx = (struct ginProxyCtx *)ginCtx;
   int pollBatch = (int)ncclParamGinProxyPollBatch();
-  if (pollBatch < 1) pollBatch = 1;
+  if (pollBatch < 0) pollBatch = 8; // auto: maximum drain per rank/pass
+  else if (pollBatch < 1) pollBatch = 1;
   if (pollBatch > 32) pollBatch = 32;
 
   for (int contextId = 0; contextId < ctx->nContexts; contextId++) {
@@ -609,7 +610,11 @@ static ncclResult_t ncclGinProxyProgress(void *ginCtx) {
     }
   }
 
-  if (ginBackend->ginProgress) ginBackend->ginProgress(ctx->ginCtx);
+  if (ginBackend->ginProgress) {
+    ncclResult_t ret = ginBackend->ginProgress(ctx->ginCtx);
+    if (ret != ncclSuccess) ctx->hasError = true;
+    NCCLCHECK(ret);
+  }
   return ncclSuccess;
 }
 

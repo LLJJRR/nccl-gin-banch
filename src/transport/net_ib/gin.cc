@@ -46,8 +46,8 @@ static ncclResult_t ncclGinIbGdrGpuSupport(bool gdaki) {
 }
 
 NCCL_PARAM(GinType, "GIN_TYPE", -1);
-NCCL_PARAM(GinIbProxyWrBatch, "GIN_IB_PROXY_WR_BATCH", 1);
-NCCL_PARAM(GinIbProxySelectiveSignal, "GIN_IB_PROXY_SELECTIVE_SIGNAL", 0);
+NCCL_PARAM(GinIbProxyWrBatch, "GIN_IB_PROXY_WR_BATCH", -1);
+NCCL_PARAM(GinIbProxySelectiveSignal, "GIN_IB_PROXY_SELECTIVE_SIGNAL", -1);
 NCCL_PARAM(GinIbProxyBatchStats, "GIN_IB_PROXY_BATCH_STATS", 0);
 
 #define NCCL_GIN_IB_PROXY_MAX_WR_BATCH 32
@@ -410,6 +410,7 @@ struct ncclGinIbProxyBatchStats {
   uint64_t selectiveBatches;
   uint64_t maxBatch;
   uint64_t postErrors;
+  uint64_t batchHist[NCCL_GIN_IB_PROXY_MAX_WR_BATCH + 1];
 };
 
 struct ncclGinIbPendingBatch {
@@ -475,6 +476,7 @@ static ncclResult_t ncclGinIbProxyFlushPending(struct ncclGinIbProxyCtx* gc, int
     gc->stats.wrs += count;
     gc->stats.postCalls++;
     gc->stats.batches++;
+    gc->stats.batchHist[count]++;
     if (selective) gc->stats.selectiveBatches++;
     if ((uint64_t)count > gc->stats.maxBatch) gc->stats.maxBatch = count;
     if (res != ncclSuccess) gc->stats.postErrors++;
@@ -538,9 +540,11 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
   ginProxyCtx[0].nranks = nranks = cComm->nranks;
 
   int wrBatchSize = (int)ncclParamGinIbProxyWrBatch();
-  if (wrBatchSize < 1) wrBatchSize = 1;
+  if (wrBatchSize < 0) wrBatchSize = 8; // auto: maximum batch; never waits to fill
+  else if (wrBatchSize < 1) wrBatchSize = 1;
   if (wrBatchSize > NCCL_GIN_IB_PROXY_MAX_WR_BATCH) wrBatchSize = NCCL_GIN_IB_PROXY_MAX_WR_BATCH;
-  int selectiveSignal = ncclParamGinIbProxySelectiveSignal() != 0;
+  int selectiveSignalParam = (int)ncclParamGinIbProxySelectiveSignal();
+  int selectiveSignal = selectiveSignalParam < 0 ? 1 : selectiveSignalParam != 0;
   if (selectiveSignal && wrBatchSize > NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH)
     wrBatchSize = NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH;
   int statsEnabled = ncclParamGinIbProxyBatchStats() != 0;
@@ -595,6 +599,7 @@ ncclResult_t ncclGinIbProxyDestroyContext(void* ginCtx) {
   if (gc[0].statsEnabled) {
     uint64_t puts = 0, wrs = 0, postCalls = 0, cqes = 0;
     uint64_t batches = 0, selectiveBatches = 0, maxBatch = 0, postErrors = 0;
+    uint64_t batchHist[NCCL_GIN_IB_PROXY_MAX_WR_BATCH + 1] = {0};
     for (int c = 0; c < nContexts; c++) {
       puts += gc[c].stats.puts;
       wrs += gc[c].stats.wrs;
@@ -603,11 +608,33 @@ ncclResult_t ncclGinIbProxyDestroyContext(void* ginCtx) {
       batches += gc[c].stats.batches;
       selectiveBatches += gc[c].stats.selectiveBatches;
       postErrors += gc[c].stats.postErrors;
+      for (int i = 1; i <= NCCL_GIN_IB_PROXY_MAX_WR_BATCH; i++)
+        batchHist[i] += gc[c].stats.batchHist[i];
       if (gc[c].stats.maxBatch > maxBatch) maxBatch = gc[c].stats.maxBatch;
     }
     INFO(NCCL_NET,
          "GIN/IB/Proxy batch stats: puts=%lu wrs=%lu postCalls=%lu cqes=%lu batches=%lu selectiveBatches=%lu maxBatch=%lu postErrors=%lu",
          puts, wrs, postCalls, cqes, batches, selectiveBatches, maxBatch, postErrors);
+
+    uint64_t singleBatches = batchHist[1];
+    uint64_t multiBatches = batches >= singleBatches ? batches - singleBatches : 0;
+    uint64_t batchedPuts = puts >= singleBatches ? puts - singleBatches : 0;
+    int fullBatchSize = gc[0].wrBatchSize;
+    uint64_t fullBatches =
+      (fullBatchSize >= 1 && fullBatchSize <= NCCL_GIN_IB_PROXY_MAX_WR_BATCH) ? batchHist[fullBatchSize] : 0;
+    double avgBatch = postCalls ? (double)wrs / (double)postCalls : 0.0;
+    double multiBatchRate = batches ? 100.0 * (double)multiBatches / (double)batches : 0.0;
+    double batchedPutRate = puts ? 100.0 * (double)batchedPuts / (double)puts : 0.0;
+    double fullBatchRate = batches ? 100.0 * (double)fullBatches / (double)batches : 0.0;
+
+    INFO(NCCL_NET,
+         "GIN/IB/Proxy batch summary: avgBatch=%.3f multiBatchRate=%.2f%% batchedPutRate=%.2f%% fullBatchSize=%d fullBatchRate=%.2f%%",
+         avgBatch, multiBatchRate, batchedPutRate, fullBatchSize, fullBatchRate);
+    for (int i = 1; i <= NCCL_GIN_IB_PROXY_MAX_WR_BATCH; i++) {
+      if (batchHist[i] != 0)
+        INFO(NCCL_NET, "GIN/IB/Proxy batch histogram: size=%d batches=%lu puts=%lu",
+             i, batchHist[i], batchHist[i] * (uint64_t)i);
+    }
   }
 
   for (int c=0; c<nContexts; c++) {
@@ -738,6 +765,7 @@ ncclResult_t ncclGinIbProxyIPut(void *ginCtx, int context, uint64_t srcOff, void
       ginProxyCtx->stats.wrs++;
       ginProxyCtx->stats.postCalls++;
       ginProxyCtx->stats.batches++;
+      ginProxyCtx->stats.batchHist[1]++;
       if (ginProxyCtx->stats.maxBatch < 1) ginProxyCtx->stats.maxBatch = 1;
     }
 

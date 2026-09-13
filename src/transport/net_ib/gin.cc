@@ -49,8 +49,10 @@ NCCL_PARAM(GinType, "GIN_TYPE", -1);
 NCCL_PARAM(GinIbProxyWrBatch, "GIN_IB_PROXY_WR_BATCH", -1);
 NCCL_PARAM(GinIbProxySelectiveSignal, "GIN_IB_PROXY_SELECTIVE_SIGNAL", -1);
 NCCL_PARAM(GinIbProxyBatchStats, "GIN_IB_PROXY_BATCH_STATS", 0);
+NCCL_PARAM(GinIbProxyCqPollBatch, "GIN_IB_PROXY_CQ_POLL_BATCH", 16);
 
 #define NCCL_GIN_IB_PROXY_MAX_WR_BATCH 32
+#define NCCL_GIN_IB_PROXY_MAX_CQ_POLL_BATCH 32
 #define NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH 8
 
 static std::mutex ncclGinIbGdakiLockMutex;
@@ -406,6 +408,8 @@ struct ncclGinIbProxyBatchStats {
   uint64_t wrs;
   uint64_t postCalls;
   uint64_t cqes;
+  uint64_t cqPollCalls;
+  uint64_t cqEmptyPolls;
   uint64_t batches;
   uint64_t selectiveBatches;
   uint64_t maxBatch;
@@ -427,9 +431,12 @@ struct ncclGinIbProxyCtx {
   void**        fullSendComm;
   int rank, nranks;
   int nContexts;
+  int queueDepth;
   int wrBatchSize;
   int selectiveSignal;
   int statsEnabled;
+  int* sendCqOutstanding;
+  int* flushCqOutstanding;
   struct ncclGinIbPendingBatch* pending;
   struct ncclGinIbProxyBatchStats stats;
 };
@@ -440,32 +447,38 @@ static ncclResult_t ncclGinIbProxyFlushPending(struct ncclGinIbProxyCtx* gc, int
   if (count == 0) return ncclSuccess;
 
   bool selective = gc->selectiveSignal && count > 1;
-  if (selective && count > NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH) {
-    WARN("GIN/IB/Proxy selective batch too large: %d", count);
-    return ncclInternalError;
-  }
 
-  struct ncclIbRequest* ownerReq = batch->reqs[count-1];
-  uint64_t packedWrId = 0;
-
-  if (selective) {
-    int ownerSlot = ownerReq - batch->comm->base.reqs;
-    packedWrId = (uint64_t)(ownerSlot & 0xff);
-    for (int r = 0; r < count-1; r++) {
-      int slot = batch->reqs[r] - batch->comm->base.reqs;
-      packedWrId |= (uint64_t)(slot & 0xff) << ((r+1)*8);
-    }
-    ownerReq->nreqs = count;
-  }
-
+  // Selective completion encoding can describe at most eight logical requests
+  // per CQE (one 8-bit request slot per wr_id byte). A posted WR chain may be
+  // larger than eight: split it into completion groups of <=8 while keeping the
+  // entire chain under one ibv_post_send(). This is important for explicit
+  // AggregateRequests runs, where the host proxy may drain up to 32 PUT GFDs in
+  // one pass without increasing CQE pressure back to one CQE per WR.
   for (int i = 0; i < count; i++) {
     batch->wr[i].next = (i+1 < count) ? &batch->wr[i+1] : NULL;
-    if (selective) {
-      batch->wr[i].send_flags = (i+1 == count) ? IBV_SEND_SIGNALED : 0;
-      batch->wr[i].wr_id = (i+1 == count) ? packedWrId : 0;
-    } else {
-      batch->wr[i].send_flags = IBV_SEND_SIGNALED;
-      batch->wr[i].wr_id = batch->reqs[i] - batch->comm->base.reqs;
+    batch->wr[i].send_flags = selective ? 0 : IBV_SEND_SIGNALED;
+    batch->wr[i].wr_id = selective ? 0 : (uint64_t)(batch->reqs[i] - batch->comm->base.reqs);
+  }
+
+  if (selective) {
+    for (int groupFirst = 0; groupFirst < count; groupFirst += NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH) {
+      int groupCount = ((count - groupFirst) < NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH ? (count - groupFirst) : NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH);
+      int ownerIndex = groupFirst + groupCount - 1;
+      struct ncclIbRequest* ownerReq = batch->reqs[ownerIndex];
+      int ownerSlot = ownerReq - batch->comm->base.reqs;
+      uint64_t packedWrId = (uint64_t)(ownerSlot & 0xff);
+
+      // The low byte names the signaled owner; the remaining bytes name the
+      // preceding requests in this completion group. Order within the packed id
+      // is irrelevant to retirement as every encoded request gets one event
+      // decremented when the owner's CQE arrives.
+      for (int r = 0; r < groupCount-1; r++) {
+        int slot = batch->reqs[groupFirst + r] - batch->comm->base.reqs;
+        packedWrId |= (uint64_t)(slot & 0xff) << ((r+1)*8);
+      }
+      ownerReq->nreqs = groupCount;
+      batch->wr[ownerIndex].send_flags = IBV_SEND_SIGNALED;
+      batch->wr[ownerIndex].wr_id = packedWrId;
     }
   }
 
@@ -483,7 +496,14 @@ static ncclResult_t ncclGinIbProxyFlushPending(struct ncclGinIbProxyCtx* gc, int
   }
 
   if (res != ncclSuccess) {
-    if (selective) ownerReq->nreqs = 1;
+    if (selective) {
+      // Restore completion-group owners so error cleanup/debug paths never leave
+      // stale multi-request metadata in reusable request slots.
+      for (int groupFirst = 0; groupFirst < count; groupFirst += NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH) {
+        int groupCount = ((count - groupFirst) < NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH ? (count - groupFirst) : NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH);
+        batch->reqs[groupFirst + groupCount - 1]->nreqs = 1;
+      }
+    }
     int badIndex = -1;
     if (badWr) {
       for (int i = 0; i < count; i++) {
@@ -501,9 +521,130 @@ static ncclResult_t ncclGinIbProxyFlushPending(struct ncclGinIbProxyCtx* gc, int
     return res;
   }
 
+  gc->sendCqOutstanding[rank] += count;
   batch->count = 0;
   batch->comm = NULL;
   batch->qp = NULL;
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinIbProxyHandleWc(struct ncclGinIbProxyCtx* gc, int rank,
+                                                struct ncclIbNetCommBase* commBase,
+                                                struct ncclIbNetCommDevBase* devBase,
+                                                const struct ibv_wc* wc,
+                                                bool flushCq) {
+  struct ncclIbRequest* ownerReq = NULL;
+  uint64_t wrId = wc->wr_id;
+
+  if (flushCq) {
+    if (wrId >= NET_IB_MAX_REQUESTS) {
+      WARN("GIN/IB/Proxy invalid FLUSH completion wr_id=%lu", wrId);
+      return ncclInternalError;
+    }
+    ownerReq = commBase->reqs + wrId;
+  } else {
+    int ownerSlot = wrId & 0xff;
+    if (ownerSlot >= NET_IB_MAX_REQUESTS) {
+      WARN("GIN/IB/Proxy invalid completion owner slot=%d wr_id=%lu", ownerSlot, wrId);
+      return ncclInternalError;
+    }
+    ownerReq = commBase->reqs + ownerSlot;
+  }
+
+  if (wc->status != IBV_WC_SUCCESS) {
+    union ncclSocketAddress addr;
+    ncclSocketGetAddr(ownerReq->sock, &addr);
+    char localGidString[INET6_ADDRSTRLEN] = "";
+    char remoteGidString[INET6_ADDRSTRLEN] = "";
+    const char* localGidStr = NULL;
+    const char* remoteGidStr = NULL;
+    if (devBase->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) {
+      localGidStr = ibvGetGidStr(&devBase->gidInfo.localGid, localGidString, sizeof(localGidString));
+      remoteGidStr = ibvGetGidStr(&commBase->remDevs[0].remoteGid, remoteGidString, sizeof(remoteGidString));
+    }
+
+    char line[SOCKET_NAME_MAXLEN+1];
+    char* hcaName = devBase->pd->context->device->name;
+    WARN("NET/IB/GIN: Got completion from peer %s with status=%d opcode=%d len=%u vendor err %u (%s)%s%s%s%s hca %s",
+         ncclSocketToString(&addr, line), wc->status, wc->opcode, wc->byte_len, wc->vendor_err,
+         ncclIbReqTypeStr[ownerReq->type], localGidStr ? " localGid ":"", localGidString,
+         remoteGidStr ? " remoteGids":"", remoteGidString, hcaName);
+    return ncclRemoteError;
+  }
+
+  if (flushCq) {
+    if (ownerReq->type != NCCL_NET_IB_REQ_FLUSH) {
+      WARN("GIN/IB/Proxy FLUSH CQ references non-FLUSH request slot=%lu type=%d", wrId, ownerReq->type);
+      return ncclInternalError;
+    }
+    if (ownerReq->events[0] <= 0) {
+      WARN("GIN/IB/Proxy completion for FLUSH request with no pending event: slot=%lu", wrId);
+      return ncclInternalError;
+    }
+    ownerReq->events[0]--;
+    if (gc->flushCqOutstanding[rank] <= 0) {
+      WARN("GIN/IB/Proxy FLUSH CQ outstanding underflow for rank=%d", rank);
+      return ncclInternalError;
+    }
+    gc->flushCqOutstanding[rank]--;
+    return ncclSuccess;
+  }
+
+  // Normal operations use one request id. A selective-signaling PUT batch packs
+  // up to eight request slots in wr_id, with the low byte naming the owner.
+  int nreqs = ownerReq->nreqs;
+  if (nreqs < 1 || nreqs > NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH) {
+    WARN("GIN/IB/Proxy invalid packed completion nreqs=%d ownerSlot=%d wr_id=%lu",
+         nreqs, (int)(wrId & 0xff), wrId);
+    return ncclInternalError;
+  }
+
+  for (int r = 0; r < nreqs; r++) {
+    int slot = (wrId >> (r*8)) & 0xff;
+    struct ncclIbRequest* batchReq = commBase->reqs + slot;
+    if (nreqs > 1 && batchReq->type != NCCL_NET_IB_REQ_GIN_IPUT) {
+      WARN("GIN/IB/Proxy packed completion references non-IPut request slot=%d type=%d wr_id=%lu",
+           slot, batchReq->type, wrId);
+      return ncclInternalError;
+    }
+    if (batchReq->events[0] <= 0) {
+      WARN("GIN/IB/Proxy request slot=%d has no pending event for wr_id=%lu", slot, wrId);
+      return ncclInternalError;
+    }
+    batchReq->events[0]--;
+  }
+
+  if (gc->sendCqOutstanding[rank] < nreqs) {
+    WARN("GIN/IB/Proxy send CQ outstanding underflow for rank=%d outstanding=%d completed=%d",
+         rank, gc->sendCqOutstanding[rank], nreqs);
+    return ncclInternalError;
+  }
+  gc->sendCqOutstanding[rank] -= nreqs;
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinIbProxyPollCq(struct ncclGinIbProxyCtx* gc, int rank,
+                                         struct ncclIbNetCommBase* commBase,
+                                         struct ncclIbNetCommDevBase* devBase,
+                                         bool flushCq) {
+  int pollBatch = (int)ncclParamGinIbProxyCqPollBatch();
+  if (pollBatch < 1) pollBatch = 1;
+  if (pollBatch > NCCL_GIN_IB_PROXY_MAX_CQ_POLL_BATCH)
+    pollBatch = NCCL_GIN_IB_PROXY_MAX_CQ_POLL_BATCH;
+
+  struct ibv_wc wc[NCCL_GIN_IB_PROXY_MAX_CQ_POLL_BATCH];
+  int wrDone = 0;
+  NCCLCHECK(wrap_ibv_poll_cq(devBase->cq, pollBatch, wc, &wrDone));
+
+  if (gc->statsEnabled) {
+    gc->stats.cqPollCalls++;
+    if (wrDone == 0) gc->stats.cqEmptyPolls++;
+    gc->stats.cqes += wrDone;
+  }
+
+  for (int i = 0; i < wrDone; i++) {
+    NCCLCHECK(ncclGinIbProxyHandleWc(gc, rank, commBase, devBase, &wc[i], flushCq));
+  }
   return ncclSuccess;
 }
 
@@ -512,11 +653,48 @@ static ncclResult_t ncclGinIbProxyProgress(void* ginCtx) {
   int nContexts = gc[0].nContexts;
   int nranks = gc[0].nranks;
 
+  // Submit PUTs staged by the host proxy first. This preserves the original
+  // proxy behavior of making newly drained GFDs visible to the NIC promptly;
+  // the CQ pass below can then reap both older completions and, when the NIC is
+  // fast enough, completions from WRs posted in this same progress pass.
   for (int c = 0; c < nContexts; c++) {
     if (gc[c].wrBatchSize <= 1) continue;
     for (int rank = 0; rank < nranks; rank++) {
       NCCLCHECK(ncclGinIbProxyFlushPending(&gc[c], rank));
     }
+  }
+
+  // Completion discovery is CQ-centric: poll each dedicated GIN send/flush CQ
+  // once per progress pass and update request event counters from the returned
+  // WC batch. Request objects remain owned/freed by test().
+  for (int c = 0; c < nContexts; c++) {
+    for (int rank = 0; rank < nranks; rank++) {
+      if (gc[c].sendCqOutstanding[rank] > 0 && gc[c].fullSendComm && gc[c].fullSendComm[rank]) {
+        struct ncclIbSendComm* sendComm = (struct ncclIbSendComm*)gc[c].fullSendComm[rank];
+        NCCLCHECK(ncclGinIbProxyPollCq(&gc[c], rank, &sendComm->base, &sendComm->devs[0].base, false));
+      }
+      if (gc[c].flushCqOutstanding[rank] > 0 && gc[c].fullRecvComm && gc[c].fullRecvComm[rank]) {
+        struct ncclIbRecvComm* recvComm = (struct ncclIbRecvComm*)gc[c].fullRecvComm[rank];
+        NCCLCHECK(ncclGinIbProxyPollCq(&gc[c], rank, &recvComm->base, &recvComm->devs[0].base, true));
+      }
+    }
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinIbProxyValidateQueueDepth(struct ncclIbSendComm* comm, int queueDepth) {
+  if (queueDepth <= 0) return ncclSuccess;
+
+  struct ibv_qp_attr qpAttr;
+  struct ibv_qp_init_attr qpInitAttr;
+  memset(&qpAttr, 0, sizeof(qpAttr));
+  memset(&qpInitAttr, 0, sizeof(qpInitAttr));
+  NCCLCHECK(wrap_ibv_query_qp(comm->base.qps[0].qp, &qpAttr, IBV_QP_CAP, &qpInitAttr));
+
+  if ((int)qpInitAttr.cap.max_send_wr < queueDepth) {
+    WARN("GIN_IB_PROXY requested queue depth %d exceeds actual send QP capacity %u",
+         queueDepth, qpInitAttr.cap.max_send_wr);
+    return ncclInvalidUsage;
   }
   return ncclSuccess;
 }
@@ -527,8 +705,13 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
   // Make sure all QP we create use the provided traffic class.
   ncclIbSetTrafficClass(cComm->ctx, config->trafficClass);
 
-  if (config->queueDepth != 0) {
-    WARN("GIN_IB_PROXY does not support specifying qp depth");
+  // GIN queueDepth is the maximum number of outstanding operations expected per
+  // context. The IB proxy request pool is bounded by NET_IB_MAX_REQUESTS, while
+  // the send QP is currently created with 2*NET_IB_MAX_REQUESTS WRs. Accept a
+  // non-zero queueDepth when the existing proxy resources can satisfy it.
+  if (config->queueDepth < 0 || config->queueDepth > NET_IB_MAX_REQUESTS) {
+    WARN("GIN_IB_PROXY queue depth %d exceeds supported outstanding request capacity %d",
+         config->queueDepth, NET_IB_MAX_REQUESTS);
     return ncclInvalidUsage;
   }
 
@@ -540,14 +723,19 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
   ginProxyCtx[0].nranks = nranks = cComm->nranks;
 
   int wrBatchSize = (int)ncclParamGinIbProxyWrBatch();
-  if (wrBatchSize < 0) wrBatchSize = 8; // auto: maximum batch; never waits to fill
+  // Keep room for explicit AggregateRequests runs to build a larger WR chain.
+  // Ordinary traffic still drains only NCCL_GIN_PROXY_POLL_BATCH descriptors
+  // (auto=8) per host pass, so its effective default batch remains eight; an
+  // aggregate run may extend to 32 and submit all of them with one post_send.
+  if (wrBatchSize < 0) wrBatchSize = NCCL_GIN_IB_PROXY_MAX_WR_BATCH;
   else if (wrBatchSize < 1) wrBatchSize = 1;
   if (wrBatchSize > NCCL_GIN_IB_PROXY_MAX_WR_BATCH) wrBatchSize = NCCL_GIN_IB_PROXY_MAX_WR_BATCH;
   int selectiveSignalParam = (int)ncclParamGinIbProxySelectiveSignal();
   int selectiveSignal = selectiveSignalParam < 0 ? 1 : selectiveSignalParam != 0;
-  if (selectiveSignal && wrBatchSize > NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH)
-    wrBatchSize = NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH;
   int statsEnabled = ncclParamGinIbProxyBatchStats() != 0;
+
+  INFO(NCCL_NET, "GIN/IB/Proxy context: requested queueDepth=%d effective request capacity=%d",
+       config->queueDepth, NET_IB_MAX_REQUESTS);
 
   void *lComm = NULL;
   char* handle = NULL, *handles = NULL;
@@ -562,9 +750,12 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
     NCCLCHECKGOTO(ncclIbMalloc((void**)&gc->fullSendComm, sizeof(void *) * nranks), ret, end);
     NCCLCHECKGOTO(ncclIbMalloc((void**)&gc->fullRecvComm, sizeof(void *) * nranks), ret, end);
     NCCLCHECKGOTO(ncclCalloc(&gc->pending, nranks), ret, end);
+    NCCLCHECKGOTO(ncclCalloc(&gc->sendCqOutstanding, nranks), ret, end);
+    NCCLCHECKGOTO(ncclCalloc(&gc->flushCqOutstanding, nranks), ret, end);
     gc->rank = cComm->rank;
     gc->nranks = nranks;
     gc->nContexts = config->nContexts;
+    gc->queueDepth = config->queueDepth;
     gc->wrBatchSize = wrBatchSize;
     gc->selectiveSignal = selectiveSignal;
     gc->statsEnabled = statsEnabled;
@@ -579,6 +770,8 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
           NCCLCHECKGOTO(ncclNetIb.accept(lComm, &gc->fullRecvComm[acceptPeer], NULL), ret, end);
       } while ((gc->fullSendComm[connectPeer] == NULL) ||
           (gc->fullRecvComm[acceptPeer] == NULL));
+      NCCLCHECKGOTO(ncclGinIbProxyValidateQueueDepth(
+                        (struct ncclIbSendComm*)gc->fullSendComm[connectPeer], config->queueDepth), ret, end);
       NCCLCHECKGOTO(ncclGinIbP2PBarrier(cComm), ret, end);
     }
   }
@@ -598,6 +791,7 @@ ncclResult_t ncclGinIbProxyDestroyContext(void* ginCtx) {
 
   if (gc[0].statsEnabled) {
     uint64_t puts = 0, wrs = 0, postCalls = 0, cqes = 0;
+    uint64_t cqPollCalls = 0, cqEmptyPolls = 0;
     uint64_t batches = 0, selectiveBatches = 0, maxBatch = 0, postErrors = 0;
     uint64_t batchHist[NCCL_GIN_IB_PROXY_MAX_WR_BATCH + 1] = {0};
     for (int c = 0; c < nContexts; c++) {
@@ -605,6 +799,8 @@ ncclResult_t ncclGinIbProxyDestroyContext(void* ginCtx) {
       wrs += gc[c].stats.wrs;
       postCalls += gc[c].stats.postCalls;
       cqes += gc[c].stats.cqes;
+      cqPollCalls += gc[c].stats.cqPollCalls;
+      cqEmptyPolls += gc[c].stats.cqEmptyPolls;
       batches += gc[c].stats.batches;
       selectiveBatches += gc[c].stats.selectiveBatches;
       postErrors += gc[c].stats.postErrors;
@@ -612,9 +808,14 @@ ncclResult_t ncclGinIbProxyDestroyContext(void* ginCtx) {
         batchHist[i] += gc[c].stats.batchHist[i];
       if (gc[c].stats.maxBatch > maxBatch) maxBatch = gc[c].stats.maxBatch;
     }
+    double cqesPerPoll = cqPollCalls ? (double)cqes / (double)cqPollCalls : 0.0;
+    double emptyPollRate = cqPollCalls ? 100.0 * (double)cqEmptyPolls / (double)cqPollCalls : 0.0;
     INFO(NCCL_NET,
          "GIN/IB/Proxy batch stats: puts=%lu wrs=%lu postCalls=%lu cqes=%lu batches=%lu selectiveBatches=%lu maxBatch=%lu postErrors=%lu",
          puts, wrs, postCalls, cqes, batches, selectiveBatches, maxBatch, postErrors);
+    INFO(NCCL_NET,
+         "GIN/IB/Proxy CQ stats: pollCalls=%lu emptyPolls=%lu emptyPollRate=%.2f%% cqesPerPoll=%.3f",
+         cqPollCalls, cqEmptyPolls, emptyPollRate, cqesPerPoll);
 
     uint64_t singleBatches = batchHist[1];
     uint64_t multiBatches = batches >= singleBatches ? batches - singleBatches : 0;
@@ -664,6 +865,10 @@ ncclResult_t ncclGinIbProxyDestroyContext(void* ginCtx) {
 
     free(gc[c].pending);
     gc[c].pending = NULL;
+    free(gc[c].sendCqOutstanding);
+    gc[c].sendCqOutstanding = NULL;
+    free(gc[c].flushCqOutstanding);
+    gc[c].flushCqOutstanding = NULL;
   }
   free(gc);
   return ncclSuccess;
@@ -760,6 +965,7 @@ ncclResult_t ncclGinIbProxyIPut(void *ginCtx, int context, uint64_t srcOff, void
     struct ibv_send_wr* bad_wr;
     NCCLCHECK(wrap_ibv_post_send(qp->qp, &wr, &bad_wr));
     ncclIbAddEvent(req, qp->devIndex);
+    ginProxyCtx->sendCqOutstanding[rank]++;
 
     if (ginProxyCtx->statsEnabled) {
       ginProxyCtx->stats.wrs++;
@@ -867,6 +1073,7 @@ ncclResult_t ncclGinIbProxyIGet(void *ginCtx, int context, uint64_t remoteOffset
   struct ibv_send_wr* bad_wr;
   NCCLCHECK(wrap_ibv_post_send(qp->qp, &wr, &bad_wr));
   ncclIbAddEvent(req, qp->devIndex);
+  ginProxyCtx->sendCqOutstanding[rank]++;
 
   *request = req;
   return ncclSuccess;
@@ -952,107 +1159,24 @@ ncclResult_t ncclGinIbProxyIPutSignal(void *ginCtx, int context, uint64_t srcOff
   struct ibv_send_wr* bad_wr;
   NCCLCHECK(wrap_ibv_post_send(qp->qp, size > 0 ? &wr[0] : &wr[1], &bad_wr));
   ncclIbAddEvent(req, qp->devIndex);
+  ginProxyCtx->sendCqOutstanding[rank]++;
   *request = req;
   return ncclSuccess;
 }
 
 ncclResult_t ncclGinIbProxyTest(void* collComm, void *request, int *done) {
   struct ncclIbRequest* req = (struct ncclIbRequest*)request;
-  struct ncclGinIbProxyCtx* ginProxyCtx = (struct ncclGinIbProxyCtx*)req->ginProxyCtx;
-  int rank = req->iput.rank;
   *done = 0;
 
-  if (req->events[0] == 0) {
-    *done = 1;
-    NCCLCHECK(ncclIbFreeRequest(req));
-    return ncclSuccess;
+  // CQ polling is performed by ncclGinIbProxyProgress(). test() only owns
+  // request retirement, which keeps request lifetime separate from completion
+  // discovery and avoids repeatedly polling the same CQ per outstanding GFD.
+  for (int d = 0; d < NCCL_IB_MAX_DEVS_PER_NIC; d++) {
+    if (req->events[d] != 0) return ncclSuccess;
   }
 
-  int wrDone = 0;
-  struct ibv_wc wc[4];
-
-  ncclIbNetCommBase* commBase;
-  ncclIbNetCommDevBase* devBase;
-  if (req->type == NCCL_NET_IB_REQ_FLUSH) {
-    struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)ginProxyCtx->fullRecvComm[rank];
-    commBase = &comm->base;
-    devBase = &comm->devs[0].base;
-  } else {
-    struct ncclIbSendComm* comm = (struct ncclIbSendComm*)ginProxyCtx->fullSendComm[rank];
-    commBase = &comm->base;
-    devBase = &comm->devs[0].base;
-  }
-
-  NCCLCHECK(wrap_ibv_poll_cq(devBase->cq, 4, wc, &wrDone));
-  for (int i = 0; i < wrDone; i++) {
-    if (ginProxyCtx->statsEnabled) ginProxyCtx->stats.cqes++;
-
-    if (wc[i].status != IBV_WC_SUCCESS) {
-      union ncclSocketAddress addr;
-      ncclSocketGetAddr(req->sock, &addr);
-      char localGidString[INET6_ADDRSTRLEN] = "";
-      char remoteGidString[INET6_ADDRSTRLEN] = "";
-      const char* localGidStr = NULL, *remoteGidStr = NULL;
-      if (req->devBases[0] && req->devBases[0]->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) {
-        localGidStr = ibvGetGidStr(&devBase->gidInfo.localGid, localGidString, sizeof(localGidString));
-        remoteGidStr = ibvGetGidStr(&commBase->remDevs[0].remoteGid, remoteGidString, sizeof(remoteGidString));
-      }
-
-      char line[SOCKET_NAME_MAXLEN+1];
-      char *hcaName = devBase->pd->context->device->name;
-      WARN("NET/IB/GIN: Got completion from peer %s with status=%d opcode=%d len=%u vendor err %u (%s)%s%s%s%s hca %s",
-          ncclSocketToString(&addr, line), wc[i].status, wc[i].opcode, wc[i].byte_len, wc[i].vendor_err, ncclIbReqTypeStr[req->type],
-          localGidStr ? " localGid ":"", localGidString, remoteGidStr ? " remoteGids":"", remoteGidString, hcaName);
-      return ncclRemoteError;
-    }
-
-    if (req->type == NCCL_NET_IB_REQ_FLUSH) {
-      struct ncclIbRequest* wcReq = commBase->reqs + wc[i].wr_id;
-      if (wcReq->events[0] <= 0) {
-        WARN("GIN/IB/Proxy completion for request with no pending event: slot=%lu", wc[i].wr_id);
-        return ncclInternalError;
-      }
-      wcReq->events[0]--;
-      if (wcReq == req && wcReq->events[0] == 0) {
-        *done = 1;
-        NCCLCHECK(ncclIbFreeRequest(wcReq));
-      }
-      continue;
-    }
-
-    // For normal operations nreqs==1. In V3 the final signaled PUT WR stores
-    // up to eight request-slot ids in wr_id and the low byte identifies the owner.
-    uint64_t wrId = wc[i].wr_id;
-    int ownerSlot = wrId & 0xff;
-    struct ncclIbRequest* ownerReq = commBase->reqs + ownerSlot;
-    int nreqs = ownerReq->nreqs;
-    if (nreqs < 1 || nreqs > NCCL_GIN_IB_PROXY_MAX_SELECTIVE_BATCH) {
-      WARN("GIN/IB/Proxy invalid packed completion nreqs=%d ownerSlot=%d wr_id=%lu",
-           nreqs, ownerSlot, wrId);
-      return ncclInternalError;
-    }
-
-    for (int r = 0; r < nreqs; r++) {
-      int slot = (wrId >> (r*8)) & 0xff;
-      struct ncclIbRequest* batchReq = commBase->reqs + slot;
-      if (nreqs > 1 && batchReq->type != NCCL_NET_IB_REQ_GIN_IPUT) {
-        WARN("GIN/IB/Proxy packed completion references non-IPut request slot=%d type=%d wr_id=%lu",
-             slot, batchReq->type, wrId);
-        return ncclInternalError;
-      }
-      if (batchReq->events[0] <= 0) {
-        WARN("GIN/IB/Proxy request slot=%d has no pending event for wr_id=%lu", slot, wrId);
-        return ncclInternalError;
-      }
-
-      batchReq->events[0]--;
-      if (batchReq == req && batchReq->events[0] == 0) {
-        *done = 1;
-        NCCLCHECK(ncclIbFreeRequest(batchReq));
-      }
-    }
-  }
-
+  *done = 1;
+  NCCLCHECK(ncclIbFreeRequest(req));
   return ncclSuccess;
 }
 
@@ -1090,6 +1214,7 @@ ncclResult_t ncclGinIbProxyIFlush(void *ginCtx, int context, void* mhandle, uint
   TIME_STOP(4);
 
   ncclIbAddEvent(req, qp->devIndex);
+  ginProxyCtx->flushCqOutstanding[rank]++;
 
   TRACE(NCCL_NET, "NET/IB: %s: Flush request posted (req=%p, comm=%p, wr_id=%ld)", __func__, req, req->base, wr.wr_id);
 

@@ -294,7 +294,7 @@ struct dispatch_memory_region_info_t {
     // Streaming RDMA signals
     unsigned signals_tail_base;               // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
-    int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 6)
+    int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 4)
 };
 
 struct combine_memory_region_info_t {
@@ -351,6 +351,7 @@ struct DispatchParams {
     int local_rank;
     int node_rank;
     int num_tokens_per_rank;
+    bool enable_packed_put;       // A/B switch for dispatch packed RDMA puts
 };
 
 // Call dispatch kernel with runtime template parameter resolution

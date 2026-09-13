@@ -13,6 +13,11 @@
 #define NCCL_GIN_PROXY_VERSION 100
 #define NCCL_GIN_PROXY_GFD_VERSION 1
 
+// Optimization flag bits encoded in GFDs. Keep these values synchronized with
+// enum ncclGinOptFlags in gin_device_common.h without pulling the device-only
+// header into the host proxy implementation.
+#define NCCL_GIN_PROXY_OPT_AGGREGATE_REQUESTS (1u << 1)
+
 typedef enum {
   ncclGinProxyOpPut = 1 << 0,
   ncclGinProxyOpBaseMask = 1 << 0,
@@ -107,7 +112,10 @@ typedef union {
     uint8_t resv : 7;
     uint16_t op;
     uint8_t resv2;
-    uint32_t resv3;
+    // Full-width device GIN optimization hints (ncclGinOptFlags). This reuses
+    // the formerly reserved 32-bit field so the 128-byte GFD ABI is unchanged
+    // while preserving future opt-flag bits beyond the low byte.
+    uint32_t optFlags;
   } __attribute__((packed)) headerExt;
 } ncclGinProxyQword_t;
 static_assert(sizeof(ncclGinProxyQword_t) == sizeof(uint64_t),

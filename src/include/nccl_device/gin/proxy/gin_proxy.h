@@ -87,7 +87,7 @@ __device__ __forceinline__ void buildGfd(ncclGinProxyGfd_t* gfd, ncclGinProxyOp_
                                          size_t dstOff, ncclGinWindow_t dstHandle, size_t size,
                                          ncclGinCounter_t counterId, ncclGinSignal_t signalId,
                                          uint64_t signalVal, ncclGinWindow_t signalWindow,
-                                         size_t signalOff) {
+                                         size_t signalOff, uint32_t optFlags = ncclGinOptFlagsDefault) {
 
   for (int i = 0; i < ncclGinProxyGfdQwords; i++) {
     gfd->qword[i].flag.v = 1;
@@ -96,6 +96,7 @@ __device__ __forceinline__ void buildGfd(ncclGinProxyGfd_t* gfd, ncclGinProxyOp_
   gfd->qword[ncclGinProxyGfdHeader].header.version = (uint64_t)NCCL_GIN_PROXY_GFD_VERSION;
   gfd->qword[ncclGinProxyGfdHeader].header.size = (uint64_t)size;
   gfd->qword[ncclGinProxyGfdHeaderExt].headerExt.op = (uint16_t)op;
+  gfd->qword[ncclGinProxyGfdHeaderExt].headerExt.optFlags = optFlags;
 
   if (op & ncclGinProxyOpFlush) {
     return;
@@ -194,7 +195,8 @@ NCCL_DEVICE_INLINE void put(Coop coop, ncclGinProxyGfd_t* gfd, ncclGinProxyGpuCt
                             bool hasInline, ncclGinWindow_t srcWnd, size_t srcOff, size_t bytes,
                             ncclGinSignalDescriptor signal, ncclGinSignalOp_t signalOp,
                             uint64_t signalVal, bool hasCounter, ncclGinCounter_t counterId,
-                            cuda::thread_scope required, cuda::thread_scope given) {
+                            cuda::thread_scope required, cuda::thread_scope given,
+                            uint32_t optFlags = ncclGinOptFlagsDefault) {
   if ((int)given > (int)cuda::thread_scope_system) {
     cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
   }
@@ -205,7 +207,7 @@ NCCL_DEVICE_INLINE void put(Coop coop, ncclGinProxyGfd_t* gfd, ncclGinProxyGpuCt
     constructProxyOp(op, /*isGet*/false, /*isFlush*/false, /*hasInline*/false, NCCL_GIN_SIGNAL_TYPE_NONE, signalOp, /*hasCounter*/false);
     nccl::gin::proxy::buildGfd(gfd, op, /*srcVal*/0, /*hasInline*/false, srcOff, srcWnd,
                                dstOff, dstWnd, DataChunkSize, /*counterId*/0, /*signalId*/0,
-                               /*signalVal*/0, nullptr, 0);
+                               /*signalVal*/0, nullptr, 0, optFlags);
     nccl::gin::proxy::postGfd<Coop>(coop, proxyCtx, gfd, peer);
     bytes -= DataChunkSize;
     srcOff += DataChunkSize;
@@ -234,7 +236,7 @@ NCCL_DEVICE_INLINE void put(Coop coop, ncclGinProxyGfd_t* gfd, ncclGinProxyGpuCt
     ncclGinProxyOp_t op;
     constructProxyOp(op, /*isGet*/false, /*isFlush*/false, hasInline, putSignalType, signalOp, hasCounter);
     nccl::gin::proxy::buildGfd(gfd, op, srcVal, hasInline, srcOff, srcWnd, dstOff, dstWnd, bytes,
-                              hasCounter ? counterId : 0, putSignalId, putSignalVal, nullptr, 0);
+                              hasCounter ? counterId : 0, putSignalId, putSignalVal, nullptr, 0, optFlags);
     nccl::gin::proxy::postGfd<Coop>(coop, proxyCtx, gfd, peer);
   }
 
@@ -367,7 +369,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_PROXY> {
     ncclGinProxyGpuCtx_t* proxyCtx = &((ncclGinProxyGpuCtx_t*)ctx.handle)[ctx.contextId];
     nccl::gin::proxy::put<Coop, uint64_t>(coop, desc, proxyCtx, peer, dstWin, dstOff, 0, false,
                                           srcWin, srcOff, bytes, signal, signalOp, signalOpArg,
-                                          hasCounter, counterId, required, given);
+                                          hasCounter, counterId, required, given, optFlags);
   }
 };
 
@@ -386,7 +388,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_PROXY> {
     ncclGinProxyGpuCtx_t* proxyCtx = &((ncclGinProxyGpuCtx_t*)ctx.handle)[ctx.contextId];
     nccl::gin::proxy::put<Coop, T>(coop, desc, proxyCtx, peer, dstWin,
                                    dstOff, srcVal, true, nullptr, 0, sizeof(T), signal,
-                                   signalOp, signalOpArg, false, 0, required, given);
+                                   signalOp, signalOpArg, false, 0, required, given, optFlags);
   }
 };
 

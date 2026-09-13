@@ -405,6 +405,7 @@ build_dispatch_param(const DispatchParams& params) {
     kp.local_rank = params.local_rank;
     kp.node_rank = params.node_rank;
     kp.num_of_tokens_per_rank = params.num_tokens_per_rank;
+    kp.enable_packed_put = params.enable_packed_put;
 
     // Pass device communicators and windows
     kp.dcomms = params.dcomms;

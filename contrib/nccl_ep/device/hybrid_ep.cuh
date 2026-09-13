@@ -96,7 +96,7 @@ struct dispatch_memory_region_info_t {
   // Streaming RDMA signals
   unsigned signals_tail_base;               // Base signal ID for tail tracking (sender -> receiver)
   // Streaming buffer configuration
-  int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 6)
+  int num_max_rdma_chunked_send_tokens;     // Batch size per RDMA put (default: 4)
 } __attribute__((__aligned__(8)));
 
 struct combine_memory_region_info_t {
@@ -126,6 +126,34 @@ __device__ __forceinline__ void warp_copy_int4(
         dst4[i] = __ldg(src4 + i);
     }
     __syncwarp();
+}
+
+// Warp-parallel byte copy used by packed dispatch staging. Use the vectorized
+// path when both endpoints and the size are 16-byte aligned, otherwise fall
+// back to a byte-strided copy so arbitrary probability/scaling tails remain
+// correct.
+__device__ __forceinline__ void warp_copy_bytes(
+    void* __restrict__ dst,
+    const void* __restrict__ src,
+    size_t bytes,
+    int lane_id)
+{
+    uintptr_t align = reinterpret_cast<uintptr_t>(dst) |
+                      reinterpret_cast<uintptr_t>(src) | bytes;
+    if ((align & (sizeof(int4) - 1)) == 0) {
+        warp_copy_int4(dst, src, bytes, lane_id);
+        return;
+    }
+
+    uint8_t* dst8 = reinterpret_cast<uint8_t*>(dst);
+    const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src);
+    for (size_t i = lane_id; i < bytes; i += 32) dst8[i] = src8[i];
+    __syncwarp();
+}
+
+__device__ __forceinline__ int nth_set_bit(uint32_t mask, int n) {
+    while (n-- > 0) mask &= mask - 1;
+    return __ffs(mask) - 1;
 }
 
 // Acquire/release lock helpers for shared memory coordination
@@ -812,6 +840,7 @@ struct dispatch_kernel_param_t{
   int node_rank;
   // The number of token output by attn layer on a rank/GPU.
   int num_of_tokens_per_rank;
+  bool enable_packed_put;
   // NCCL GIN context
   ncclDevComm_t* dcomms;           // Device communicators array (1 element, on device)
   ncclWindow_t nccl_window;        // Single registered window handle (by value)
@@ -911,6 +940,7 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
                                                       int num_ctx_per_comm,
                                                       void* gin_base_ptr,
                                                       unsigned signals_base,
+                                                      bool enable_packed_put,
                                                       const struct dispatch_memory_region_info_t *mr_info,
                                                       SMEM_TYPE* smem_buffer_ptr,
                                                       const int HIDDEN_DIM,
@@ -969,49 +999,145 @@ __forceinline__ __device__ void N2N_warp_group_device_function(const int local_r
       int remote_node_id = remote_idx < node_rank ? remote_idx : remote_idx + 1;
       int rank_in_remote = remote_idx < node_rank ? node_rank - 1 : node_rank;
 
-      int dense_dst_offset = smem_mr_info_ptr->rdma_inter_node_group_packed_offset +
+      size_t dense_dst_offset = smem_mr_info_ptr->rdma_inter_node_group_packed_offset +
                                rank_in_remote * smem_mr_info_ptr->max_tokens_per_dest *
                                smem_mr_info_ptr->bytes_per_entry +
                                static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK) *
                                smem_mr_info_ptr->bytes_per_entry;
 
 
-      for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range;
-           token_idx_in_chunk += ncclCoopWarp().size()) {
-        int token_idx = token_idx_in_chunk + chunk_base_token_idx;
-        bool need_write = attn_to_rdma_map[token_idx * (NUM_LSA_TEAMS - 1) + remote_idx];
-        size_t base_offset = dense_dst_offset;
+      if (enable_packed_put) {
+        // Pack routed tokens into the pre-registered per-destination staging
+        // region, preserving source-token order. The receiver already consumes
+        // the same packed [token][prob][sf] layout using bytes_per_entry.
+        int dense_before = 0;
+        int lane = ncclCoopWarp().thread_rank();
+        uint8_t* gin_base = reinterpret_cast<uint8_t*>(gin_base_ptr);
+        size_t staging_tile_base = smem_mr_info_ptr->rdma_send_staging_offset +
+                                   static_cast<size_t>(remote_idx) *
+                                   smem_mr_info_ptr->max_tokens_per_dest *
+                                   smem_mr_info_ptr->bytes_per_entry;
+        int max_batch = smem_mr_info_ptr->num_max_rdma_chunked_send_tokens;
+        if (max_batch < 1) max_batch = 1;
+        if (max_batch > HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE)
+          max_batch = HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE;
 
-        for (int i = 0; i < token_idx_in_chunk; i++) {
-          bool prev_need_write = attn_to_rdma_map[((i + chunk_base_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
-          if (prev_need_write) {
-            base_offset += smem_mr_info_ptr->bytes_per_entry;
+        for (int iter_base = 0; iter_base < token_range; iter_base += 32) {
+          int token_idx_in_chunk = iter_base + lane;
+          bool valid = token_idx_in_chunk < token_range;
+          bool need_write = valid &&
+            attn_to_rdma_map[(chunk_base_token_idx + token_idx_in_chunk) *
+                             (NUM_LSA_TEAMS - 1) + remote_idx];
+          uint32_t routed_mask = __ballot_sync(0xffffffffu, need_write);
+          int routed_count = __popc(routed_mask);
+
+          for (int batch_first = 0; batch_first < routed_count; batch_first += max_batch) {
+            int remaining = routed_count - batch_first;
+            int batch_count = max_batch < remaining ? max_batch : remaining;
+
+            // Build batch_count contiguous packed entries. All lanes cooperate
+            // on each entry copy; this is intentionally conservative for the
+            // first implementation and keeps the staging visibility protocol
+            // simple and verifiable.
+            for (int b = 0; b < batch_count; b++) {
+              int token_lane = nth_set_bit(routed_mask, batch_first + b);
+              int source_token_in_chunk = iter_base + token_lane;
+              int token_idx = chunk_base_token_idx + source_token_in_chunk;
+              size_t dense_idx = static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK +
+                                                     dense_before + batch_first + b);
+              uint8_t* packed_entry = gin_base + staging_tile_base +
+                                      dense_idx * smem_mr_info_ptr->bytes_per_entry;
+
+              const void* token_src = gin_base + smem_mr_info_ptr->attn_input_token_offset +
+                                      static_cast<size_t>(token_idx) * token_bytes;
+              warp_copy_bytes(packed_entry, token_src, token_bytes, lane);
+
+              size_t entry_off = token_bytes;
+              if constexpr(FORWARD_DISPATCH) {
+                const void* prob_src = gin_base + smem_mr_info_ptr->attn_input_prob_offset +
+                                       static_cast<size_t>(token_idx * NUM_LSA_TEAMS + remote_node_id) *
+                                       prob_bytes;
+                warp_copy_bytes(packed_entry + entry_off, prob_src, prob_bytes, lane);
+                entry_off += prob_bytes;
+              }
+
+              if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+                const void* sf_src = gin_base + smem_mr_info_ptr->attn_input_scaling_factor_offset +
+                                     static_cast<size_t>(token_idx) * sf_bytes;
+                warp_copy_bytes(packed_entry + entry_off, sf_src, sf_bytes, lane);
+              }
+            }
+
+            // Every lane publishes the global stores it contributed before
+            // lane 0 exposes this staging range to the NIC through GIN.
+            __threadfence_system();
+            __syncwarp();
+
+            if (lane == 0) {
+              size_t dense_first = static_cast<size_t>(chunk_idx * NUM_OF_TOKENS_PER_CHUNK +
+                                                       dense_before + batch_first);
+              size_t staging_src_off = staging_tile_base +
+                                       dense_first * smem_mr_info_ptr->bytes_per_entry;
+              size_t remote_dst_off = dense_dst_offset +
+                                      static_cast<size_t>(dense_before + batch_first) *
+                                      smem_mr_info_ptr->bytes_per_entry;
+              net.put(world, remote_node_id,
+                      nccl_window, remote_dst_off,
+                      nccl_window, staging_src_off,
+                      static_cast<size_t>(batch_count) * smem_mr_info_ptr->bytes_per_entry,
+                      ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+                      cuda::thread_scope_thread, cuda::thread_scope_system,
+                      ncclGinOptFlagsAggregateRequests);
+            }
+            __syncwarp();
           }
+          dense_before += routed_count;
         }
+      } else {
+        // Original fine-grained dispatch path retained for A/B validation.
+        for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < token_range;
+             token_idx_in_chunk += ncclCoopWarp().size()) {
+          int token_idx = token_idx_in_chunk + chunk_base_token_idx;
+          bool need_write = attn_to_rdma_map[token_idx * (NUM_LSA_TEAMS - 1) + remote_idx];
+          size_t base_offset = dense_dst_offset;
 
-        if (need_write) {
-          net.put(world, remote_node_id,
-                  nccl_window, base_offset,
-                  nccl_window, smem_mr_info_ptr->attn_input_token_offset + token_idx * token_bytes,
-                  token_bytes,
-                  ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests); // TODO(Katie): check thread scope args
-
-          if constexpr(FORWARD_DISPATCH) {
-            size_t offset = base_offset + token_bytes;
-            net.put(world, remote_node_id,
-                    nccl_window, offset,
-                    nccl_window, smem_mr_info_ptr->attn_input_prob_offset + (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes,
-                    prob_bytes,
-                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+          for (int i = 0; i < token_idx_in_chunk; i++) {
+            bool prev_need_write = attn_to_rdma_map[((i + chunk_base_token_idx) * (NUM_LSA_TEAMS - 1)) + remote_idx];
+            if (prev_need_write) base_offset += smem_mr_info_ptr->bytes_per_entry;
           }
 
-          if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-            size_t offset = base_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
+          if (need_write) {
             net.put(world, remote_node_id,
-                    nccl_window, offset,
-                    nccl_window, smem_mr_info_ptr->attn_input_scaling_factor_offset + (token_idx * sf_bytes),
-                    sf_bytes,
-                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},  cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+                    nccl_window, base_offset,
+                    nccl_window, smem_mr_info_ptr->attn_input_token_offset + token_idx * token_bytes,
+                    token_bytes,
+                    ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+                    cuda::thread_scope_thread, cuda::thread_scope_device,
+                    ncclGinOptFlagsAggregateRequests);
+
+            if constexpr(FORWARD_DISPATCH) {
+              size_t offset = base_offset + token_bytes;
+              net.put(world, remote_node_id,
+                      nccl_window, offset,
+                      nccl_window, smem_mr_info_ptr->attn_input_prob_offset +
+                                   (token_idx * NUM_LSA_TEAMS + remote_node_id) * prob_bytes,
+                      prob_bytes,
+                      ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+                      cuda::thread_scope_thread, cuda::thread_scope_device,
+                      ncclGinOptFlagsAggregateRequests);
+            }
+
+            if constexpr(std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
+              size_t offset = base_offset + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
+              net.put(world, remote_node_id,
+                      nccl_window, offset,
+                      nccl_window, smem_mr_info_ptr->attn_input_scaling_factor_offset +
+                                   (token_idx * sf_bytes),
+                      sf_bytes,
+                      ncclGin_None{}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{},
+                      cuda::thread_scope_thread, cuda::thread_scope_device,
+                      ncclGinOptFlagsAggregateRequests);
+            }
           }
         }
       }
@@ -3684,7 +3810,7 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
       <INTER_NODE_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH>
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.attn_to_rdma_map,
        param.dcomms, param.nccl_window, param.num_gin_comms, param.num_ctx_per_comm, param.gin_base_ptr, param.signals_base,
-       &param.mr_info, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+       param.enable_packed_put, &param.mr_info, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
     }
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size()){
     G2S_warp_group_device_function

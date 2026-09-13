@@ -702,7 +702,9 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     size_t flags_sz = align_size(static_cast<size_t>(nNodes) * sizeof(uint64_t), GIN_ALIGNMENT);
     size_t token_staging_sz = align_size(static_cast<size_t>(ep_group->config.max_tokens_per_rank) * ep_group->hidden * sizeof(uint16_t), GIN_ALIGNMENT);
     size_t dense_prob_sz = align_size(static_cast<size_t>(ep_group->config.max_tokens_per_rank) * ep_group->config.num_experts * sizeof(float), GIN_ALIGNMENT);
-    size_t scaling_factor_staging_sz = align_size(static_cast<size_t>(ep_group->config.max_tokens_per_rank) * sizeof(float), GIN_ALIGNMENT);
+    size_t scaling_factor_staging_sz = align_size(
+        static_cast<size_t>(ep_group->config.max_tokens_per_rank) *
+        (ep_group->hidden / 128) * sizeof(float), GIN_ALIGNMENT);
 
     size_t bytes_per_token_entry = ep_group->hidden * sizeof(uint16_t);
     size_t bytes_per_prob_entry = (ep_group->num_local_experts * n_ranks_per_node) * sizeof(float);
@@ -758,7 +760,12 @@ static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group,
     ep_group->ht_buffers.scaling_factor_staging_buffer = reinterpret_cast<float*>(ptr + offset);
     offset += scaling_factor_staging_sz;
 
+    // The packed send/receive regions are addressed by offsets from gin_base_ptr
+    // inside the device kernels, so no host pointer is required here. Still advance
+    // the partition cursor over both regions to keep the layout accounting complete.
     offset += rdma_send_staging_sz;
+    offset += rdma_recv_packed_sz;
+    assert(offset == total_gin_buffer_size);
 
     // Calculate offsets for kernel mr_info
     size_t cur_offset = 0;
@@ -1937,20 +1944,25 @@ ncclResult_t ncclEpDispatch(
         // Detect FP8 mode based on datatype
         bool use_fp8 = (x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2);
 
-        // For FP8: copy user scaling factors to pre-registered staging buffer
+        // For FP8: validate scaling factors before dereferencing, then copy them
+        // to the pre-registered staging buffer for internode GIN access.
+        if (use_fp8) {
+            assert(scales != nullptr && "FP8 tokens require scales input");
+            assert(scales->ndim == 2 && tensor_is_contiguous(scales));
+            assert(scales->datatype == ncclFloat32);
+            assert(scales->sizes[0] == handle->num_tokens);
+            assert(scales->sizes[1] == static_cast<unsigned>(group->hidden / 128));
+        }
         float* scales_ptr = use_fp8 ? static_cast<float*>(scales->data) : nullptr;  // Default: use user buffer directly
         if (use_fp8 && !is_single_node && handle->hybridep.scaling_factor_staging_buffer != nullptr) {
             // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
-            size_t scales_size = x->sizes[0] * sizeof(float);  // One scale per token
+            size_t scales_size = static_cast<size_t>(x->sizes[0]) *
+                                 (group->hidden / 128) * sizeof(float);
             CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.scaling_factor_staging_buffer, scales->data, scales_size, cudaMemcpyDeviceToDevice, stream));
             scales_ptr = handle->hybridep.scaling_factor_staging_buffer;
         }
         if (!use_fp8) {
             assert(x->datatype == ncclBfloat16);
-        } else {
-            assert(scales != nullptr && "FP8 tokens require scales input");
-            assert(scales->ndim == 2 && tensor_is_contiguous(scales));
-            assert(scales->datatype == ncclFloat32);
         }
 
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
@@ -2044,12 +2056,22 @@ ncclResult_t ncclEpDispatch(
         params.num_ctx_per_comm = is_single_node ? 0 : group->gin_config.num_ctx_per_comm;
         params.gin_base_ptr = is_single_node ? nullptr : group->gin_config.gin_base_ptr;
         params.signals_base = group->gin_config.signals_base;
-        // Use offsets relative to gin_base_ptr
-        // All buffers are part of one large registered window
-        // Calculate bytes_per_entry for batched staging
-        size_t bytes_per_token_entry = group->hidden * sizeof(uint16_t);  // token data
-        size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_rank_count) * sizeof(float);  // prob data
-        size_t bytes_per_sf_entry = (group->hidden / 128) * sizeof(float);  // scaling factor (FP8)
+        // Use offsets relative to gin_base_ptr. Keep the legacy padded entry
+        // stride when packed dispatch is disabled so the A/B baseline is byte-for-byte
+        // compatible with the original layout. Packed dispatch uses the compact runtime
+        // [token][prob][sf] stride so consecutive entries can be sent in one GIN put.
+        const char* packed_dispatch_env = std::getenv("NCCL_EP_HT_PACKED_DISPATCH");
+        params.enable_packed_put = packed_dispatch_env != nullptr && std::atoi(packed_dispatch_env) != 0;
+
+        size_t bytes_per_token_entry = params.enable_packed_put ?
+            group->hidden * (use_fp8 ? sizeof(uint8_t) : sizeof(uint16_t)) :
+            group->hidden * sizeof(uint16_t);
+        size_t bytes_per_prob_entry = params.enable_packed_put ?
+            (forward_dispatch ? (group->num_local_experts * group->lsa_rank_count) * sizeof(float) : 0) :
+            (group->num_local_experts * group->lsa_rank_count) * sizeof(float);
+        size_t bytes_per_sf_entry = params.enable_packed_put ?
+            (use_fp8 ? (group->hidden / 128) * sizeof(float) : 0) :
+            (group->hidden / 128) * sizeof(float);
         size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry + bytes_per_sf_entry;
 
         params.mr_info = {

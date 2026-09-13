@@ -16,6 +16,9 @@
 
 NCCL_PARAM(GinProxyQueueSize, "GIN_PROXY_QUEUE_SIZE", -1);
 NCCL_PARAM(GinProxyPollBatch, "GIN_PROXY_POLL_BATCH", -1);
+NCCL_PARAM(GinProxyCiStats, "GIN_PROXY_CI_STATS", 0);
+NCCL_PARAM(GinProxyAggregateMaxDrain, "GIN_PROXY_AGGREGATE_MAX_DRAIN", 32);
+NCCL_PARAM(GinProxyAggregateStats, "GIN_PROXY_AGGREGATE_STATS", 0);
 extern int64_t ncclParamIbDataDirect();
 extern int64_t ncclParamDmaBufEnable();
 
@@ -69,6 +72,12 @@ struct ginProxyCtx {
   void *signalsGinHandle;
   uint64_t *signalsDev;
   bool hasError;
+  uint64_t ciRetired;
+  uint64_t ciStores;
+  uint64_t ciMaxAdvance;
+  uint64_t aggregateGfds;
+  uint64_t aggregateExtendedGfds;
+  uint64_t aggregateBoundaries;
   int nContexts;
   int nCountersPerContext;
   int nSignalsPerContext;
@@ -106,7 +115,12 @@ static ncclResult_t proxyGinPollCompletions(void *collComm,
                                             struct ginProxyCtx *ctx,
                                             struct ginProxyHostGpuCtx *hostGpuCtx) {
   for (int targetRank = 0; targetRank < ctx->nRanks; targetRank++) {
-    // loop on all seen but unconsumed GFDs
+    uint32_t publishedCi = hostGpuCtx->cisShadow[targetRank];
+
+    // Loop on all seen but unconsumed GFDs. cisShadow is advanced locally over
+    // the contiguous completed prefix and published to GPU-visible memory once
+    // per rank/pass below. This preserves the no-hole CI rule while avoiding a
+    // GDR/PCIe store for every individual retirement.
     for (uint32_t i = hostGpuCtx->cisShadow[targetRank]; i < hostGpuCtx->sis[targetRank]; i++) {
       uint32_t idx = i & (hostGpuCtx->queueSize - 1);
       struct ginProxyGfdState *state =
@@ -137,13 +151,26 @@ static ncclResult_t proxyGinPollCompletions(void *collComm,
           }
         }
       }
-      // allow holes in the CI space to get resolved
+
+      // Only advance over the contiguous completed prefix. A completion hole
+      // stops retirement because the GPU must not reuse a descriptor before all
+      // preceding descriptors have completed.
       if (state->done && i == hostGpuCtx->cisShadow[targetRank]) {
-        // tell the GPU that we have consumed the GFD
-        COMPILER_ATOMIC_STORE(&hostGpuCtx->cis[targetRank], ++hostGpuCtx->cisShadow[targetRank],
-                          std::memory_order_relaxed);
-        TRACE(NCCL_NET, "Updated cis[%u] to %u for context %d", targetRank, hostGpuCtx->cisShadow[targetRank], hostGpuCtx->contextId);
+        hostGpuCtx->cisShadow[targetRank]++;
       }
+    }
+
+    uint32_t newCi = hostGpuCtx->cisShadow[targetRank];
+    if (newCi != publishedCi) {
+      uint32_t advance = newCi - publishedCi;
+      COMPILER_ATOMIC_STORE(&hostGpuCtx->cis[targetRank], newCi, std::memory_order_relaxed);
+      if (ncclParamGinProxyCiStats()) {
+        ctx->ciRetired += advance;
+        ctx->ciStores++;
+        if (advance > ctx->ciMaxAdvance) ctx->ciMaxAdvance = advance;
+      }
+      TRACE(NCCL_NET, "Updated cis[%u] from %u to %u for context %d",
+            targetRank, publishedCi, newCi, hostGpuCtx->contextId);
     }
   }
 
@@ -159,6 +186,19 @@ static inline uint64_t extractSignalVal(ncclGinProxyGfd_t *gfd) {
 
 static ncclGinProxyOp_t extractOp(ncclGinProxyGfd_t *gfd) {
   return (ncclGinProxyOp_t)gfd->qword[ncclGinProxyGfdHeaderExt].headerExt.op;
+}
+
+static uint32_t extractOptFlags(ncclGinProxyGfd_t *gfd) {
+  return (uint32_t)gfd->qword[ncclGinProxyGfdHeaderExt].headerExt.optFlags;
+}
+
+static bool isAggregatePut(ncclGinProxyGfd_t *gfd) {
+  ncclGinProxyOp_t op = extractOp(gfd);
+  bool purePut = (op & ncclGinProxyOpBaseMask) == ncclGinProxyOpPut &&
+                 !(op & (ncclGinProxyOpWithSignalInc | ncclGinProxyOpWithSignalAdd |
+                         ncclGinProxyOpVASignal | ncclGinProxyOpGet | ncclGinProxyOpFlush |
+                         ncclGinProxyOpWithCounter));
+  return purePut && (extractOptFlags(gfd) & NCCL_GIN_PROXY_OPT_AGGREGATE_REQUESTS);
 }
 
 static int proxyGinPollGfd(struct ginProxyCtx *ctx, ginProxyHostGpuCtx *hostGpuCtx, int targetRank,
@@ -437,8 +477,6 @@ static ncclResult_t ncclGinProxyCreateContext(void* collComm, ncclGinConfig_t* c
   proxyCtx->nRanks = cComm->nRanks;
   int nContexts = proxyCtx->nContexts = config->nContexts;
 
-  NCCLCHECK(ginBackend->createContext(cComm->collComm, config, &proxyCtx->ginCtx, NULL));
-
   // Sanitize the queue size
   uint64_t queueSize = ncclParamGinProxyQueueSize();
   uint32_t maxRequests = NCCL_NET_MAX_REQUESTS * cComm->props.maxRecvs;
@@ -463,6 +501,18 @@ static ncclResult_t ncclGinProxyCreateContext(void* collComm, ncclGinConfig_t* c
       "NCCL_GIN_PROXY_QUEUE_SIZE is not a power of two, using the default/maximum value instead");
     queueSize = maxRequests;
   }
+
+  // The device-side producer must have at least queueDepth descriptors available,
+  // otherwise the upper-layer GIN outstanding-depth contract cannot be honored.
+  // queueSize is power-of-two for the ring while queueDepth does not need to be.
+  if (config->queueDepth > 0 && queueSize < (uint64_t)config->queueDepth) {
+    WARN("GIN Proxy queue size %lu is smaller than requested queue depth %d",
+         queueSize, config->queueDepth);
+    free(proxyCtx);
+    return ncclInvalidUsage;
+  }
+
+  NCCLCHECK(ginBackend->createContext(cComm->collComm, config, &proxyCtx->ginCtx, NULL));
 
   if (config->nCounters) {
     // Allocate the counters on the GPU or CPU depending on GDR
@@ -544,6 +594,18 @@ static ncclResult_t ncclGinProxyDestroyContext(void *ginCtx) {
   if (!ginCtx) return ncclSuccess;
   struct ginProxyCtx *ctx = (struct ginProxyCtx *)ginCtx;
 
+  if (ncclParamGinProxyCiStats()) {
+    double avgAdvance = ctx->ciStores ? (double)ctx->ciRetired / (double)ctx->ciStores : 0.0;
+    INFO(NCCL_NET,
+         "GIN Proxy CI stats: retired=%lu stores=%lu avgAdvance=%.3f maxAdvance=%lu",
+         ctx->ciRetired, ctx->ciStores, avgAdvance, ctx->ciMaxAdvance);
+  }
+  if (ncclParamGinProxyAggregateStats()) {
+    INFO(NCCL_NET,
+         "GIN Proxy aggregate stats: aggregateGfds=%lu extendedGfds=%lu boundaries=%lu",
+         ctx->aggregateGfds, ctx->aggregateExtendedGfds, ctx->aggregateBoundaries);
+  }
+
   NCCLCHECK(ginBackend->destroyContext(ctx->ginCtx));
 
   // Free counters
@@ -593,19 +655,43 @@ static ncclResult_t ncclGinProxyProgress(void *ginCtx) {
   else if (pollBatch < 1) pollBatch = 1;
   if (pollBatch > 32) pollBatch = 32;
 
+  // First consume newly produced GFDs. The backend progress call below then
+  // polls existing CQs and submits any PUT batches staged by these descriptors.
   for (int contextId = 0; contextId < ctx->nContexts; contextId++) {
     struct ginProxyHostGpuCtx *hostGpuCtx = ctx->hostGpuCtx + contextId;
-    NCCLCHECK(proxyGinPollCompletions(ctx->collComm, ctx, hostGpuCtx));
     for (int targetRank = 0; targetRank < ctx->nRanks; targetRank++) {
-      for (int p = 0; p < pollBatch; p++) {
+      int aggregateMaxDrain = (int)ncclParamGinProxyAggregateMaxDrain();
+      if (aggregateMaxDrain < pollBatch) aggregateMaxDrain = pollBatch;
+      if (aggregateMaxDrain > 256) aggregateMaxDrain = 256;
+
+      bool inAggregateRun = false;
+      int p = 0;
+      while (p < pollBatch || (inAggregateRun && p < aggregateMaxDrain)) {
         ncclGinProxyGfd_t gfd;
         struct ginProxyGfdState *state = NULL;
         if (!proxyGinPollGfd(ctx, hostGpuCtx, targetRank, &gfd, &state)) break;
+
+        bool aggregate = isAggregatePut(&gfd);
+        if (ncclParamGinProxyAggregateStats() && aggregate) {
+          ctx->aggregateGfds++;
+          if (p >= pollBatch) ctx->aggregateExtendedGfds++;
+        }
 
         ncclResult_t ret =
           proxyGinProcessGfd(ctx, hostGpuCtx, targetRank, &gfd, state);
         if (ret) ctx->hasError = ret;
         NCCLCHECK(ret);
+        p++;
+
+        if (aggregate) {
+          inAggregateRun = true;
+        } else if (inAggregateRun) {
+          if (ncclParamGinProxyAggregateStats()) ctx->aggregateBoundaries++;
+          // The first non-aggregate descriptor is an ordering boundary. It is
+          // processed in this pass so backend IPutSignal/GET/FLUSH can force
+          // pending PUT submission before the boundary operation.
+          break;
+        }
       }
     }
   }
@@ -615,6 +701,13 @@ static ncclResult_t ncclGinProxyProgress(void *ginCtx) {
     if (ret != ncclSuccess) ctx->hasError = true;
     NCCLCHECK(ret);
   }
+
+  // CQ-centric backends update request event counters in ginProgress(). Retire
+  // those requests and publish contiguous CIs in the same host progress pass so
+  // completion discovery does not incur an artificial extra progress iteration.
+  for (int contextId = 0; contextId < ctx->nContexts; contextId++) {
+    NCCLCHECK(proxyGinPollCompletions(ctx->collComm, ctx, ctx->hostGpuCtx + contextId));
+  }
   return ncclSuccess;
 }
 
@@ -622,7 +715,7 @@ static ncclResult_t ncclGinProxyQueryLastError(void *ginCtx, bool *hasError) {
   struct ginProxyCtx *ctx = (struct ginProxyCtx *)ginCtx;
   *hasError = ctx->hasError;
   if (ctx->hasError == ncclSuccess && ginBackend->queryLastError)
-    NCCLCHECK(ginBackend->queryLastError(ginCtx, hasError));
+    NCCLCHECK(ginBackend->queryLastError(ctx->ginCtx, hasError));
   return ncclSuccess;
 }
 
